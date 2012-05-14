@@ -1,74 +1,51 @@
 #!/usr/bin/env ruby
 
+require 'rubygems'
 require "optparse"
 require "ostruct"
 require "json"
 
-settings = OpenStruct.new
-opts = OptionParser.new do |opts|
-  opts.on("-n PACKAGENAME", "--name PACKAGENAME",
-          "What name to give to the package") do |name|
-    settings.name = name
-  end
+# packages up npm packages for "global" installation
+# assumes node is installed in /usr
+# so packages land in /usr/lib/node_modules the same
+# as if you used npm to put them there
 
-  opts.on("-v VERSION", "--version VERSION",
-          "version to give the package") do |version|
-    settings.version = version
-  end
-
-  opts.on("-t OUTPUTTYPE", "--type OUTPUTTYPE",
-          "what kind of package you want as output (deb, etc)") do |packagetype|
-    settings.packagetype = packagetype
-  end
-end
-
-args = opts.parse(ARGV)
-
-if !["deb"].include?(settings.packagetype)
-  $stderr.puts "Unsupported output package type '#{settings.packagetype}'." \
-               "Only supports 'deb' right now."
-  exit 1
-end
-
-if !settings.name
-  $stderr.puts "No npm package name given (missing -n?)"
-  exit 1
-end
-
-builddir="#{Dir.pwd}/npm2pkg"
 # Prefix package names with 'nodejs-'
 PACKAGEPREFIX = "nodejs-"
+  
+def npm2pkg(name, version)
+  # every npm package gets its own build directory
+  thisdir = Dir.pwd
+  builddir="#{thisdir}/npm2pkg/#{name}/#{version}"
+  # create all of the intermediate directories
+  [
+    "#{thisdir}/npm2pkg",
+    "#{thisdir}/npm2pkg/#{name}",
+    builddir, 
+    "#{builddir}/usr",
+    "#{builddir}/usr/bin",
+    "#{builddir}/usr/share",
+    "#{builddir}/usr/share/man"
+  ].each { |path| Dir.mkdir(path) if !File.exists?(path) }
 
-Dir.mkdir(builddir) if !File.exists?(builddir)
-File.open("#{builddir}/.npmrc", "w") do |file|
-  file.puts "root = #{builddir}/usr/lib/node"
-  file.puts "binroot = #{builddir}/usr/lib/node/bin"
-  file.puts "manroot = #{builddir}/usr/share/man"
-end
+  # make a custom .npmrc
+  File.open("#{builddir}/.npmrc", "w") do |file|
+    file.puts "root = #{builddir}/usr"
+    file.puts "binroot = #{builddir}/usr/bin"
+    file.puts "manroot = #{builddir}/usr/share/man"
+  end
 
-## Trick npm into using a custom .npmrc
-system("env - PATH=$PATH HOME=#{builddir} npm install #{settings.name} #{settings.version}")
+  ## Trick npm into using the custom .npmrc
+  npmcmd = "env - PATH=$PATH HOME=#{builddir} npm install -g #{name}@#{version} --prefix=#{builddir}/usr"
+  system npmcmd
 
-# Find all installed npms in builddir, make packages.
-Dir.glob("#{builddir}/usr/lib/node/.npm/*/*") do |path|
-  next if File.symlink?(path)
-  puts path
-
-  # Load the package.json and glean any information from it, then invoke pkg.rb
-  package = JSON.parse(File.new("#{path}/package/package.json").read())
-
-  # TODO(sissel): Ideally we want to say any version with the same 'release' number, like
-  # So we'll specify deps of {v}-1 <= x <= {v}-999999....
-  depends = Dir.glob("#{path}/dependson/*@*") \
-    .collect { |p| PACKAGEPREFIX + File.basename(p) } \
-    .collect { |p| n,v = p.split("@");
-      ["#{n} (>= #{v}-1)", "#{n} (<= #{v}-99999999999999)"]
-  }.flatten
+  # Load the package.json and glean some information from it, then invoke fpm
+  package = JSON.parse(File.new("#{builddir}/usr/lib/node_modules/#{name}/package.json").read())
 
   if package["author"]
-    maintainer = package["author"]
+    maintainer = "'#{package["author"]}'"
   else
-    m = package["maintainers"][0] \
+    m = "'#{package["maintainers"][0]}'" \
       rescue { "name" => "missing upstream author", "email" => ENV["USER"] }
     maintainer = "#{m["name"]} <#{m["email"]}>"
   end
@@ -77,28 +54,52 @@ Dir.glob("#{builddir}/usr/lib/node/.npm/*/*") do |path|
     "-n", "#{PACKAGEPREFIX}#{package["name"]}",
     "-v", package["version"],
     "-m", maintainer,
-    "-a", "all",
+    "-t", "deb",
+    "-s", "dir",
+    "-C", builddir,
+    "-p", "#{PACKAGEPREFIX}#{package["name"]}-VERSION_ARCH.deb",
+    "usr" 
   ]
-
-  depends.each do |dep|
-    pkgcmd += ["-d", dep]
-  end
-
-  pkgcmd += ["-p", "#{PACKAGEPREFIX}#{package["name"]}-VERSION_ARCH.deb"]
-  pkgcmd += ["-C", builddir]
-  pkgcmd << "usr/lib/node/.npm/#{package["name"]}/active"
-  pkgcmd << "usr/lib/node/.npm/#{package["name"]}/#{package["version"]}"
-  pkgcmd << "usr/lib/node/#{package["name"]}"
-  pkgcmd << "usr/lib/node/#{package["name"]}@#{package["version"]}"
-
-  # Include bin files, install to usr/lib/node/bin
-  (package["bin"] or []).each do |bin, script|
-    pkgcmd << "usr/lib/node/bin/#{bin}"
-    pkgcmd << "usr/lib/node/bin/#{bin}@#{package["version"]}"
-  end
-
-  # TODO(sissel): We could include manpages and docs, but I don't care right
-  # now. If you want it, I accept patches! :)
-
   system *pkgcmd
+
+end
+
+if __FILE__ == $0
+  settings = OpenStruct.new
+  settings.packagetype = 'deb' # this is all we know how to do atm anyway...
+  opts = OptionParser.new do |opts|
+    opts.on("-n PACKAGENAME", "--name PACKAGENAME",
+            "What name to give to the package") do |name|
+      settings.name = name
+    end
+
+    opts.on("-v VERSION", "--version VERSION",
+            "version to give the package") do |version|
+      settings.version = version
+    end
+
+    opts.on("-t OUTPUTTYPE", "--type OUTPUTTYPE",
+            "what kind of package you want as output (deb, etc)") do |packagetype|
+      settings.packagetype = packagetype
+    end
+  end
+
+  args = opts.parse(ARGV)
+
+  if !["deb"].include?(settings.packagetype)
+    $stderr.puts "Unsupported output package type '#{settings.packagetype}'." \
+                 "Only supports 'deb' right now."
+    exit 1
+  end
+
+  if !settings.name
+    $stderr.puts "No npm package name given (missing -n?)"
+    exit 1
+  end
+
+  if !settings.version
+    $stderr.puts "No npm package version given (missing -v?)"
+    exit 1
+  end
+  npm2pkg(settings.name, settings.version)
 end
